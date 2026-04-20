@@ -14,6 +14,35 @@ from .utils import pad_sequence
 from .utils import HOP_SIZE
 
 
+def _resolve_split_name(split_info: dict, dataset_name: str) -> str:
+    """Resolve dataset key with backward-compatible aliases."""
+    if dataset_name in split_info:
+        return dataset_name
+    alias_map = {
+        "singeval_p1": "singmospro-p1",
+        "singeval_p2": "singmospro-p2",
+        "singeval_p3": "singmospro-p3",
+        "singeval_p4": "singmospro-p4",
+        "singeval_p5": "singmospro-p5",
+    }
+    alias = alias_map.get(dataset_name)
+    if alias in split_info:
+        return alias
+    raise KeyError(f"Dataset split key not found: {dataset_name}")
+
+
+def _collect_utts(split_info: dict, datasets: list, split_key: str) -> list:
+    utts = []
+    if "all" in datasets:
+        for dataset in split_info.keys():
+            utts.extend(split_info[dataset].get(split_key, []))
+    else:
+        for dataset_name in datasets:
+            resolved = _resolve_split_name(split_info, dataset_name)
+            utts.extend(split_info[resolved].get(split_key, []))
+    return utts
+
+
 class MOSDataset(Dataset):
     def __init__(
         self, 
@@ -21,6 +50,7 @@ class MOSDataset(Dataset):
         utt_list, 
         score_infos=None,
         sys_info=None,
+        utt_to_batch_id=None,
         use_domain_id: bool = False,
         use_judge_id: bool = False,
         use_pitch: bool = False,
@@ -36,6 +66,7 @@ class MOSDataset(Dataset):
         self.use_pitch = use_pitch
         self.use_domain_id = use_domain_id
         self.sys_info = sys_info
+        self.utt_to_batch_id = utt_to_batch_id or {}
         self.padding_mode = padding_mode  # 保存填充方式
         assert pitch_type in ["raw", "note", "histogram"], "pitch_type must be note or histogram"
         self.pitch_type = pitch_type
@@ -47,6 +78,7 @@ class MOSDataset(Dataset):
         wavs = {}
         gt_utt_scores = {}
         domain_ids = {}
+        batch_ids = {}
         for idx in score_info.keys():
             # judge 0 means the mean of judges
             mean_id = idx + "_0"
@@ -58,6 +90,7 @@ class MOSDataset(Dataset):
             wavs[mean_id] = os.path.join(datadir, score_info[idx]["wav"])
             sysnames[score_info[idx]["sys_id"]] = True
             domain_ids[mean_id] = sys_info[sys_id]["tag"]["domain_id"]
+            batch_ids[mean_id] = self.utt_to_batch_id.get(idx, "unknown")
             uttnames.append(idx)
             if use_judge_id:
                 for judge, judge_score in zip(score_info[idx]["score"]["judges"], score_info[idx]["score"]["scores"]):
@@ -67,12 +100,14 @@ class MOSDataset(Dataset):
                     gt_utt_scores[judge_id] = float(judge_score)
                     wavs[judge_id] = os.path.join(datadir, score_info[idx]["wav"])
                     domain_ids[judge_id] = sys_info[sys_id]["tag"]["domain_id"]
+                    batch_ids[judge_id] = self.utt_to_batch_id.get(idx, "unknown")
         self.sysnames = sorted(sysnames.keys())
         self.uttnames = sorted(uttnames)
         self.wavnames = sorted(wavnames)
         self.wavs = {k: v for k, v in sorted(wavs.items(), key=lambda x: x[0])}
         self.gt_utt_scores = {k: v for k, v in sorted(gt_utt_scores.items(), key=lambda x: x[0])}
         self.domain_ids = {k: v for k, v in sorted(domain_ids.items(), key=lambda x: x[0])}
+        self.batch_ids = {k: v for k, v in sorted(batch_ids.items(), key=lambda x: x[0])}
         logging.info(f'remained utt number: {len(self.wavnames)}, remained sys number: {len(self.sysnames)}')
 
         
@@ -111,7 +146,9 @@ class MOSDataset(Dataset):
 
         gt_utt_score = torch.tensor([self.gt_utt_scores[wavname]], dtype=torch.float32)
         domain_id = int(self.domain_ids[wavname])
+        batch_id = self.batch_ids[wavname]
         ret_dict.update(domain_id=domain_id)
+        ret_dict.update(batch_id=batch_id)
 
         items = wavname.split('_')
         wavname = "".join(items[:-1])
@@ -180,6 +217,10 @@ class MOSDataset(Dataset):
         if "domain_id" in ret_dicts[0]:
             domain_ids = [rd['domain_id'] for rd in ret_dicts]
             collate_ret_dict["domain_id"] = torch.tensor(domain_ids)
+        
+        if "batch_id" in ret_dicts[0]:
+            batch_ids = [rd["batch_id"] for rd in ret_dicts]
+            collate_ret_dict["batch_id"] = batch_ids
 
         if "pitch_var" in ret_dicts[0]:
             pitch_var = [rd['pitch_var'] for rd in ret_dicts]
@@ -204,7 +245,9 @@ def setup_dataloader_from_DATA(
     config: dict,
     dataset_path: str,
     train_datasets: list = ["singeval_p1"],
+    valid_datasets: list = None,
     merge_diff_train: bool = True,
+    return_valid_loader: bool = False,
 ):
     # For SingMOS dataset
     with open(f"{dataset_path}/info/split.json", "r") as f:
@@ -214,22 +257,23 @@ def setup_dataloader_from_DATA(
     with open(f"{dataset_path}/info/sys_info.json", "r") as f:
         sys_info = json.load(f)
     
+    utt_to_batch_id = {}
+    for batch_name, payload in split_info.items():
+        for split_key in ("train", "valid", "test"):
+            for utt in payload.get(split_key, []):
+                utt_to_batch_id[utt] = batch_name
+    
     if merge_diff_train is False:
         assert len(train_datasets) == 1
 
-    train_list = []
-    if "all" in train_datasets:
-        for dataset in split_info.keys():
-            train_list.extend(split_info[dataset]["train"])
-    else:
-        for train_dataset in train_datasets:
-            train_list.extend(split_info[train_dataset]["train"])
+    train_list = _collect_utts(split_info, train_datasets, "train")
     
     train_set = MOSDataset(
         datadir=dataset_path,
         utt_list=train_list,
         score_infos=score_info["utterance"],
         sys_info=sys_info,
+        utt_to_batch_id=utt_to_batch_id,
         use_domain_id=config["model_param"]["use_domain_id"],
         use_judge_id=config["model_param"]["use_judge_id"],
         use_pitch=config["model_param"]["use_pitch"],
@@ -249,4 +293,36 @@ def setup_dataloader_from_DATA(
         collate_fn=train_set.collate_fn,
         pin_memory=True,
     )
-    return trainloader
+
+    if not return_valid_loader:
+        return trainloader
+
+    if valid_datasets is None:
+        valid_datasets = train_datasets
+    valid_list = _collect_utts(split_info, valid_datasets, "valid")
+
+    valid_set = MOSDataset(
+        datadir=dataset_path,
+        utt_list=valid_list,
+        score_infos=score_info["utterance"],
+        sys_info=sys_info,
+        utt_to_batch_id=utt_to_batch_id,
+        use_domain_id=config["model_param"]["use_domain_id"],
+        use_judge_id=config["model_param"]["use_judge_id"],
+        use_pitch=config["model_param"]["use_pitch"],
+        pitch_type=config["model_param"]["pitch_type"],
+        sample_rate=config["sample_rate"],
+        max_duration=config["max_duration"],
+        padding_mode=config["padding_mode"],
+    )
+    logging.info(f"valid_set: {len(valid_set)}")
+
+    validloader = DataLoader(
+        valid_set,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        collate_fn=valid_set.collate_fn,
+        pin_memory=True,
+    )
+    return trainloader, validloader

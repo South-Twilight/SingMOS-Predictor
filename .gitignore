@@ -1,7 +1,9 @@
-DATA
 __pycache__
 *.__pycache__
+
 checkpoints
-ckpt
 wandb
+results
+dataset
+DATA
 answer

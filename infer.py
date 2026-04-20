@@ -312,8 +312,9 @@ def main():
 
     for test_set in args.test_sets:
         logging.info(f'Loading data {test_set}')
-        eval_list = split_info[test_set]["eval"]
+        eval_list = split_info[test_set]["test"]
         eval_loader, eval_set, score_info = build_eval_loader(datadir, model_config, eval_list, score_info, sys_info)
+        continue
 
         # Infer model
         all_pred_sys_MOS, all_pred_utt_MOS = infer_mos(model, eval_loader, test_set, device)

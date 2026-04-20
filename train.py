@@ -7,6 +7,7 @@ import logging
 import glob
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import scipy.stats
 
 import numpy as np
 import torch
@@ -33,6 +34,75 @@ def set_all_random_seed(seed: int):
     torch.random.manual_seed(seed)
 
 
+def evaluate_validation(net, validloader, device):
+    net.eval()
+    all_preds = []
+    all_labels = []
+    all_batch_ids = []
+    epoch_val_loss = 0.0
+
+    with torch.no_grad():
+        for data in tqdm(validloader, desc="Valid", leave=False):
+            batch = extract_batch(data, device)
+            batch["is_train"] = False
+            _, _, ret_val = net(**batch)
+            preds = ret_val["utt_score"].detach().cpu().numpy().astype(np.float64)
+            labels = batch["gt_utt_score"].detach().cpu().numpy().astype(np.float64)
+            ret_dict = data[-1]
+            if "batch_id" not in ret_dict:
+                raise NotImplementedError(
+                    "Validation requires ret_dict['batch_id']. "
+                    "Please provide batch_id from dataloader."
+                )
+            batch_ids = list(ret_dict["batch_id"])
+
+            all_preds.extend(preds.tolist())
+            all_labels.extend(labels.tolist())
+            all_batch_ids.extend(batch_ids)
+            epoch_val_loss += float(np.mean((preds - labels) ** 2))
+
+    val_loss = epoch_val_loss / max(1, len(validloader))
+    grouped = {}
+    for pred, label, bid in zip(all_preds, all_labels, all_batch_ids):
+        if bid not in grouped:
+            grouped[bid] = {"preds": [], "labels": []}
+        grouped[bid]["preds"].append(pred)
+        grouped[bid]["labels"].append(label)
+
+    total_n = len(all_preds)
+    weighted_srcc = 0.0
+    weighted_rmse = 0.0
+    group_metrics = {}
+    for bid, values in grouped.items():
+        preds = np.asarray(values["preds"], dtype=np.float64)
+        labels = np.asarray(values["labels"], dtype=np.float64)
+        n = len(preds)
+        rmse = float(np.sqrt(np.mean((preds - labels) ** 2)))
+        srcc = float(scipy.stats.spearmanr(labels, preds)[0]) if n > 1 else 0.0
+        if np.isnan(srcc):
+            srcc = 0.0
+        weight = n / max(1, total_n)
+        weighted_srcc += weight * srcc
+        weighted_rmse += weight * rmse
+        group_metrics[bid] = {
+            "n": n,
+            "weight": weight,
+            "srcc": srcc,
+            "rmse": rmse,
+        }
+
+    return {
+        "num_samples": total_n,
+        "val_loss": val_loss,
+        "val_utt_srcc_avg": float(weighted_srcc),
+        "val_utt_rmse_avg": float(weighted_rmse),
+        "group_metrics": group_metrics,
+        "preds": all_preds,
+        "labels": all_labels,
+        "batch_ids": all_batch_ids,
+    }
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--datadir', type=str, required=True, help='Path of your DATA/ directory')
@@ -42,7 +112,7 @@ def get_parser():
     parser.add_argument('--outdir', type=str, default='checkpoints', help='Output directory for checkpoints')
     parser.add_argument('--arch', type=str, default='sslmos', help='model architecture')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed')
-    parser.add_argument('--use_wandb', type=bool, default=False, help='Use wandb')
+    parser.add_argument('--use_wandb', type=bool, default=True, help='Use wandb')
     parser.add_argument('--resume_train', type=bool, default=True, help='Resume training from latest checkpoint in outdir')
     return parser
 
@@ -135,7 +205,7 @@ def init_wandb(args, config):
     if args.use_wandb:
         wdb_name = args.model_config.split("/")[-1].split(".")[0] + "_" + args.dataname + "_" + str(args.seed)
         logging.info("wandb_name: {}".format(wdb_name))
-        wandb.init(project="SingEval", name=wdb_name, config=exp_config)
+        wandb.init(project="SingMOSPro", name=wdb_name, config=exp_config)
     else:
         logging.info("wandb is not used")
     return exp_config
@@ -234,6 +304,7 @@ def main():
     grad_clip = float(config.get("grad_clip", 0.0))
     max_epoch = int(config.get("max_epoch", 1))
     patience_cfg = int(config.get("train_patience", 5))
+    val_rmse_guard = float(config.get("val_rmse_guard", 0.55))
 
     # 初始化文件日志（需在知道 outdir 后尽早调用）
     os.makedirs(args.outdir, exist_ok=True)
@@ -247,13 +318,18 @@ def main():
     loss_history = []
 
     # Data
-    trainloader = setup_dataloader_from_DATA(
+    train_datasets = config.get("train_datasets", ["singeval_p1"])
+    valid_datasets = config.get("valid_datasets", train_datasets)
+    trainloader, validloader = setup_dataloader_from_DATA(
         config,
         args.datadir,
-        train_datasets=config.get("train_datasets", ["singeval_p1"]),
+        train_datasets=train_datasets,
+        valid_datasets=valid_datasets,
         merge_diff_train=True,
+        return_valid_loader=True,
     )
-    logging.info(f"Train datasets: {config.get('train_datasets', ['singeval_p1'])}")
+    logging.info(f"Train datasets: {train_datasets}")
+    logging.info(f"Valid datasets: {valid_datasets}")
     logging.info(f"Steps per epoch: {len(trainloader)}")
 
     # Model & Optimizer
@@ -279,7 +355,8 @@ def main():
     scaler = GradScaler(enabled=use_amp)
 
     n_steps_per_epoch = len(trainloader)
-    best_utt_loss = float('inf')
+    best_val_srcc = float('-inf')
+    best_train_loss = float('inf')
     patience = patience_cfg
 
     try: 
@@ -327,17 +404,86 @@ def main():
             logging.info('EPOCH: ' + str(epoch))
             logging.info('AVG EPOCH TRAIN LOSS: ' + str(avg_train_loss))
             
-            # 简易早停：基于训练损失/utt_loss
-            if avg_train_loss < best_utt_loss:
-                logging.info('Loss has decreased')
-                best_utt_loss = avg_train_loss
-                save_checkpoint(net, optimizer, epoch, args.outdir)
-                patience = patience_cfg
+            val_result = evaluate_validation(net, validloader, device)
+            valid_num_samples = int(val_result["num_samples"])
+
+            if valid_num_samples == 0:
+                logging.warning(
+                    "[VAL] No valid samples found. Fallback to train-loss based checkpoint selection."
+                )
+                if args.use_wandb:
+                    wandb.log({
+                        "val/num_samples": 0,
+                        "train/avg_epoch_loss": avg_train_loss,
+                        "train/epoch": epoch,
+                    })
+
+                if avg_train_loss < best_train_loss:
+                    best_train_loss = avg_train_loss
+                    save_checkpoint(net, optimizer, epoch, args.outdir, tag="best_train_loss")
+                    patience = patience_cfg
+                    logging.info(
+                        f"Saved best checkpoint by train loss: epoch={epoch}, avg_train_loss={avg_train_loss:.6f}"
+                    )
+                else:
+                    logging.info(
+                        f"No train-loss improvement at epoch={epoch}: current={avg_train_loss:.6f}, "
+                        f"best={best_train_loss:.6f}"
+                    )
+                    patience -= 1
+                    if patience <= 0:
+                        logging.info('Early stopping (train-loss patience exhausted)')
+                        break
             else:
-                patience -= 1
-                if patience <= 0:
-                    logging.info('Early stopping')
-                    break
+                val_srcc = val_result["val_utt_srcc_avg"]
+                val_rmse = val_result["val_utt_rmse_avg"]
+
+                logging.info(
+                    f"[VAL] epoch={epoch} weighted_srcc={val_srcc:.6f} weighted_rmse={val_rmse:.6f} "
+                    f"(rmse_guard={val_rmse_guard:.4f})"
+                )
+                for bid, m in sorted(val_result["group_metrics"].items()):
+                    logging.info(
+                        f"[VAL][{bid}] n={m['n']} weight={m['weight']:.4f} srcc={m['srcc']:.6f} rmse={m['rmse']:.6f}"
+                    )
+
+                if args.use_wandb:
+                    val_log = {
+                        "val/loss": val_result["val_loss"],
+                        "val/utt_srcc_avg": val_srcc,
+                        "val/utt_rmse_avg": val_rmse,
+                        "val/num_samples": valid_num_samples,
+                        "val/epoch": epoch,
+                    }
+                    for bid, m in val_result["group_metrics"].items():
+                        val_log[f"val/{bid}/srcc"] = m["srcc"]
+                        val_log[f"val/{bid}/rmse"] = m["rmse"]
+                        val_log[f"val/{bid}/n"] = m["n"]
+                    wandb.log(val_log)
+
+                should_save_best = (val_srcc > best_val_srcc) and (val_rmse < val_rmse_guard)
+                if should_save_best:
+                    best_val_srcc = val_srcc
+                    save_checkpoint(net, optimizer, epoch, args.outdir, tag="best_srcc")
+                    patience = patience_cfg
+                    logging.info(
+                        f"Saved best checkpoint: epoch={epoch}, val_utt_srcc_avg={val_srcc:.6f}, "
+                        f"val_utt_rmse_avg={val_rmse:.6f}"
+                    )
+                else:
+                    if val_rmse >= val_rmse_guard:
+                        logging.info(
+                            f"Skip checkpoint at epoch={epoch}: val_utt_rmse_avg={val_rmse:.6f} "
+                            f">= guard {val_rmse_guard:.6f}"
+                        )
+                    else:
+                        logging.info(
+                            f"No SRCC improvement at epoch={epoch}: current={val_srcc:.6f}, best={best_val_srcc:.6f}"
+                        )
+                    patience -= 1
+                    if patience <= 0:
+                        logging.info('Early stopping (validation patience exhausted)')
+                        break
     except Exception as e:
         logging.info(f"Error: {e}")
         raise e
